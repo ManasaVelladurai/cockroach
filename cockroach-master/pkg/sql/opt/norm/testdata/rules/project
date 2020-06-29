@@ -1,0 +1,775 @@
+exec-ddl
+CREATE TABLE a (x INT PRIMARY KEY, y INT, f FLOAT, s STRING)
+----
+
+exec-ddl
+CREATE TABLE b (x INT PRIMARY KEY, z INT)
+----
+
+# --------------------------------------------------
+# EliminateProject
+# --------------------------------------------------
+
+# Same order, same names.
+norm expect=EliminateProject
+SELECT x, y FROM a
+----
+scan a
+ ├── columns: x:1!null y:2
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# Different order, aliased names.
+norm expect=EliminateProject
+SELECT a.y AS aliasy, a.x FROM a
+----
+scan a
+ ├── columns: aliasy:2 x:1!null
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# Reordered, duplicate, aliased columns.
+norm expect=EliminateProject
+SELECT a.y AS alias1, a.x, a.y AS alias1, a.x FROM a
+----
+scan a
+ ├── columns: alias1:2 x:1!null alias1:2 x:1!null
+ ├── key: (1)
+ └── fd: (1)-->(2)
+
+# Added column (projection should not be eliminated).
+norm expect-not=EliminateProject
+SELECT *, 1 r FROM a
+----
+project
+ ├── columns: x:1!null y:2 f:3 s:4 r:5!null
+ ├── key: (1)
+ ├── fd: ()-->(5), (1)-->(2-4)
+ ├── scan a
+ │    ├── columns: x:1!null y:2 f:3 s:4
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── projections
+      └── 1 [as=r:5]
+
+# --------------------------------------------------
+# MergeProjects
+# --------------------------------------------------
+
+# Inner project has no synthesized columns.
+norm expect=MergeProjects
+SELECT y+1 AS r FROM (SELECT a.y FROM a, b WHERE a.x=b.x) a
+----
+project
+ ├── columns: r:7
+ ├── inner-join (hash)
+ │    ├── columns: a.x:1!null y:2 b.x:5!null
+ │    ├── key: (5)
+ │    ├── fd: (1)-->(2), (1)==(5), (5)==(1)
+ │    ├── scan a
+ │    │    ├── columns: a.x:1!null y:2
+ │    │    ├── key: (1)
+ │    │    └── fd: (1)-->(2)
+ │    ├── scan b
+ │    │    ├── columns: b.x:5!null
+ │    │    └── key: (5)
+ │    └── filters
+ │         └── a.x:1 = b.x:5 [outer=(1,5), constraints=(/1: (/NULL - ]; /5: (/NULL - ]), fd=(1)==(5), (5)==(1)]
+ └── projections
+      └── y:2 + 1 [as=r:7, outer=(2)]
+
+# Outer and inner projections have synthesized columns.
+norm expect=MergeProjects
+SELECT y1, f+1 FROM (SELECT y+1 AS y1, f FROM a)
+----
+project
+ ├── columns: y1:5 "?column?":6
+ ├── scan a
+ │    └── columns: y:2 f:3
+ └── projections
+      ├── f:3 + 1.0 [as="?column?":6, outer=(3)]
+      └── y:2 + 1 [as=y1:5, outer=(2)]
+
+# Multiple synthesized columns in both outer and inner projections.
+norm expect=MergeProjects
+SELECT y1, f+1, x2, s||'foo' FROM (SELECT y+1 AS y1, f, s, x*2 AS x2 FROM a)
+----
+project
+ ├── columns: y1:5 "?column?":7 x2:6!null "?column?":8
+ ├── scan a
+ │    ├── columns: x:1!null y:2 f:3 s:4
+ │    ├── key: (1)
+ │    └── fd: (1)-->(2-4)
+ └── projections
+      ├── f:3 + 1.0 [as="?column?":7, outer=(3)]
+      ├── s:4 || 'foo' [as="?column?":8, outer=(4)]
+      ├── y:2 + 1 [as=y1:5, outer=(2)]
+      └── x:1 * 2 [as=x2:6, outer=(1)]
+
+# Outer project selects subset of inner columns.
+norm expect=MergeProjects
+SELECT y1 FROM (SELECT y+1 AS y1, f*2 AS f2 FROM a)
+----
+project
+ ├── columns: y1:5
+ ├── scan a
+ │    └── columns: y:2
+ └── projections
+      └── y:2 + 1 [as=y1:5, outer=(2)]
+
+# Don't merge, since outer depends on inner.
+norm expect-not=MergeProjects
+SELECT y1*2, y1/2 FROM (SELECT y+1 AS y1 FROM a)
+----
+project
+ ├── columns: "?column?":6 "?column?":7
+ ├── project
+ │    ├── columns: y1:5
+ │    ├── scan a
+ │    │    └── columns: y:2
+ │    └── projections
+ │         └── y:2 + 1 [as=y1:5, outer=(2)]
+ └── projections
+      ├── y1:5 * 2 [as="?column?":6, outer=(5)]
+      └── y1:5 / 2 [as="?column?":7, outer=(5)]
+
+# Discard all inner columns.
+norm expect=MergeProjects
+SELECT 1 r FROM (SELECT y+1, x FROM a) a
+----
+project
+ ├── columns: r:6!null
+ ├── fd: ()-->(6)
+ ├── scan a
+ └── projections
+      └── 1 [as=r:6]
+
+# --------------------------------------------------
+# MergeProjectWithValues
+# --------------------------------------------------
+
+norm expect=MergeProjectWithValues
+SELECT column1, 3 FROM (VALUES (1, 2))
+----
+values
+ ├── columns: column1:1!null "?column?":3!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1,3)
+ └── (1, 3)
+
+# Only passthrough columns.
+norm expect=MergeProjectWithValues
+SELECT column1, column3 FROM (VALUES (1, 2, 3))
+----
+values
+ ├── columns: column1:1!null column3:3!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(1,3)
+ └── (1, 3)
+
+# Only synthesized columns.
+norm expect=MergeProjectWithValues
+SELECT 4, 5 FROM (VALUES (1, 2, 3))
+----
+values
+ ├── columns: "?column?":4!null "?column?":5!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(4,5)
+ └── (4, 5)
+
+# Don't trigger rule when there is more than one Values row.
+norm expect-not=MergeProjectWithValues
+SELECT column1, 3 FROM (VALUES (1, 2), (1, 4))
+----
+project
+ ├── columns: column1:1!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── fd: ()-->(3)
+ ├── values
+ │    ├── columns: column1:1!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1,)
+ │    └── (1,)
+ └── projections
+      └── 3 [as="?column?":3]
+
+# Don't trigger rule when Project column depends on Values column.
+norm expect-not=MergeProjectWithValues
+SELECT column1+1, 3 FROM (VALUES ($1::int, $2::int))
+----
+project
+ ├── columns: "?column?":3 "?column?":4!null
+ ├── cardinality: [1 - 1]
+ ├── has-placeholder
+ ├── key: ()
+ ├── fd: ()-->(3,4)
+ ├── values
+ │    ├── columns: column1:1
+ │    ├── cardinality: [1 - 1]
+ │    ├── has-placeholder
+ │    ├── key: ()
+ │    ├── fd: ()-->(1)
+ │    └── ($1::INT8,)
+ └── projections
+      ├── column1:1 + 1 [as="?column?":3, outer=(1)]
+      └── 3 [as="?column?":4]
+
+# --------------------------------------------------
+# FoldTupleAccessIntoValues
+# --------------------------------------------------
+
+# Simple case with VALUES operator.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).@1, (tup).@2 FROM (VALUES ((1,2)), ((3,4))) AS v(tup)
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── (1, 2)
+ └── (3, 4)
+
+# Simple case with unnest function.
+norm expect=FoldTupleAccessIntoValues
+SELECT (Tuples).@1, (Tuples).@2 FROM unnest(ARRAY[(1,2),(3,4)]) AS Tuples
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── (1, 2)
+ └── (3, 4)
+
+# Case with tuples containing multiple types.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).@1, (tup).@2, (tup).@3 FROM (VALUES ((1,'2',3.0)), ((4,'5',NULL::DECIMAL))) AS v(tup)
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null "?column?":4
+ ├── cardinality: [2 - 2]
+ ├── (1, '2', 3.0)
+ └── (4, '5', NULL)
+
+# Case with one tuple field referenced zero times, one field referenced once,
+# and one field referenced twice.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).@2, (tup).@3, ARRAY[(tup).@3] FROM (VALUES ((1,2,3))) AS v(tup)
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null array:4!null
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(2-4)
+ └── (2, 3, ARRAY[3])
+
+# Case with tuples of empty tuples.
+norm expect=FoldTupleAccessIntoValues
+SELECT (Tuples).@1, (Tuples).@2 FROM unnest(ARRAY[((),()),((),())]) AS Tuples
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── ((), ())
+ └── ((), ())
+
+# Case with subquery projection.
+norm expect=FoldTupleAccessIntoValues
+SELECT (SELECT (tup).@1 * x FROM b) FROM (VALUES ((1,2)), ((3,4))) AS v(tup)
+----
+project
+ ├── columns: "?column?":5
+ ├── cardinality: [1 - ]
+ ├── ensure-distinct-on
+ │    ├── columns: "?column?":4 rownum:8!null
+ │    ├── grouping columns: rownum:8!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── cardinality: [1 - ]
+ │    ├── key: (8)
+ │    ├── fd: (8)-->(4)
+ │    ├── left-join-apply
+ │    │    ├── columns: "?column?":4 column1_1:6!null rownum:8!null
+ │    │    ├── cardinality: [2 - ]
+ │    │    ├── fd: (8)-->(6)
+ │    │    ├── ordinality
+ │    │    │    ├── columns: column1_1:6!null rownum:8!null
+ │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    ├── key: (8)
+ │    │    │    ├── fd: (8)-->(6)
+ │    │    │    └── values
+ │    │    │         ├── columns: column1_1:6!null
+ │    │    │         ├── cardinality: [2 - 2]
+ │    │    │         ├── (1,)
+ │    │    │         └── (3,)
+ │    │    ├── project
+ │    │    │    ├── columns: "?column?":4
+ │    │    │    ├── outer: (6)
+ │    │    │    ├── scan b
+ │    │    │    │    ├── columns: x:2!null
+ │    │    │    │    └── key: (2)
+ │    │    │    └── projections
+ │    │    │         └── x:2 * column1_1:6 [as="?column?":4, outer=(2,6)]
+ │    │    └── filters (true)
+ │    └── aggregations
+ │         └── const-agg [as="?column?":4, outer=(4)]
+ │              └── "?column?":4
+ └── projections
+      └── "?column?":4 [as="?column?":5, outer=(4)]
+
+# Case where columns are unnested and then pruned away because the surrounding
+# project only references an outer column.
+norm expect=FoldTupleAccessIntoValues
+SELECT (SELECT ((x).@1) FROM (VALUES ((5,6)),((7,8)))) FROM (VALUES ((1,2)), ((3,4))) v(x);
+----
+project
+ ├── columns: "?column?":6!null
+ ├── cardinality: [1 - 4]
+ ├── ensure-distinct-on
+ │    ├── columns: "?column?":3!null rownum:9!null
+ │    ├── grouping columns: rownum:9!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── cardinality: [1 - 4]
+ │    ├── key: (9)
+ │    ├── fd: (9)-->(3)
+ │    ├── project
+ │    │    ├── columns: "?column?":3!null rownum:9!null
+ │    │    ├── cardinality: [4 - 4]
+ │    │    ├── fd: (9)-->(3)
+ │    │    ├── inner-join (cross)
+ │    │    │    ├── columns: column1_1:7!null rownum:9!null
+ │    │    │    ├── cardinality: [4 - 4]
+ │    │    │    ├── fd: (9)-->(7)
+ │    │    │    ├── ordinality
+ │    │    │    │    ├── columns: column1_1:7!null rownum:9!null
+ │    │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    │    ├── key: (9)
+ │    │    │    │    ├── fd: (9)-->(7)
+ │    │    │    │    └── values
+ │    │    │    │         ├── columns: column1_1:7!null
+ │    │    │    │         ├── cardinality: [2 - 2]
+ │    │    │    │         ├── (1,)
+ │    │    │    │         └── (3,)
+ │    │    │    ├── values
+ │    │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    │    ├── ()
+ │    │    │    │    └── ()
+ │    │    │    └── filters (true)
+ │    │    └── projections
+ │    │         └── column1_1:7 [as="?column?":3, outer=(7)]
+ │    └── aggregations
+ │         └── const-agg [as="?column?":3, outer=(3)]
+ │              └── "?column?":3
+ └── projections
+      └── "?column?":3 [as="?column?":6, outer=(3)]
+
+# Case with named tuple access.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).a, (tup).b
+FROM (VALUES
+        (((1,2) AS a,b)),
+        (((3,4) AS a,b))
+     ) v(tup)
+----
+values
+ ├── columns: a:2!null b:3!null
+ ├── cardinality: [2 - 2]
+ ├── ((1, 2) AS a, b)
+ └── ((3, 4) AS a, b)
+
+# Case with wildcard tuple access on a named tuple.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).*
+FROM (VALUES
+        (((1,2) AS a,b)),
+        (((3,4) AS a,b))
+     ) v(tup)
+----
+values
+ ├── columns: a:2!null b:3!null
+ ├── cardinality: [2 - 2]
+ ├── ((1, 2) AS a, b)
+ └── ((3, 4) AS a, b)
+
+# Case with wildcard tuple access on an unnamed tuple.
+norm expect=FoldTupleAccessIntoValues
+SELECT (tup).*
+FROM (VALUES
+        ((1,2)),
+        ((3,4))
+     ) v(tup)
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── (1, 2)
+ └── (3, 4)
+
+# No-op case because the Values operator has more than one column.
+norm expect-not=FoldTupleAccessIntoValues
+SELECT (col1).@1, (col2).@1 FROM (VALUES ((1,2),(3,4)), ((5,6),(7,8))) AS v(col1, col2)
+----
+project
+ ├── columns: "?column?":3 "?column?":4
+ ├── cardinality: [2 - 2]
+ ├── values
+ │    ├── columns: column1:1 column2:2
+ │    ├── cardinality: [2 - 2]
+ │    ├── ((1, 2), (3, 4))
+ │    └── ((5, 6), (7, 8))
+ └── projections
+      ├── (column1:1).@1 [as="?column?":3, outer=(1)]
+      └── (column2:2).@1 [as="?column?":4, outer=(2)]
+
+# No-op case because the single column in Values is not of type tuple.
+norm expect-not=FoldTupleAccessIntoValues
+SELECT col[1], col[2] FROM unnest(ARRAY[[1,2],[3,4]]) AS col
+----
+project
+ ├── columns: col:2 col:3
+ ├── cardinality: [2 - 2]
+ ├── values
+ │    ├── columns: unnest:1!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (ARRAY[1,2],)
+ │    └── (ARRAY[3,4],)
+ └── projections
+      ├── unnest:1[1] [as=col:2, outer=(1)]
+      └── unnest:1[2] [as=col:3, outer=(1)]
+
+# No-op case because one of the tuple rows in Values can only be determined at
+# run-time. Put dynamic tuple expression at end of list to ensure that all rows
+# are checked.
+norm expect-not=FoldTupleAccessIntoValues
+SELECT (tup).@1, (tup).@2 FROM (VALUES ((3,4)), ((SELECT (x, z) FROM b))) AS v(tup)
+----
+project
+ ├── columns: "?column?":5 "?column?":6
+ ├── cardinality: [2 - 2]
+ ├── values
+ │    ├── columns: column1:4
+ │    ├── cardinality: [2 - 2]
+ │    ├── ((3, 4),)
+ │    └── tuple
+ │         └── subquery
+ │              └── max1-row
+ │                   ├── columns: "?column?":3
+ │                   ├── error: "more than one row returned by a subquery used as an expression"
+ │                   ├── cardinality: [0 - 1]
+ │                   ├── key: ()
+ │                   ├── fd: ()-->(3)
+ │                   └── project
+ │                        ├── columns: "?column?":3
+ │                        ├── scan b
+ │                        │    ├── columns: x:1!null z:2
+ │                        │    ├── key: (1)
+ │                        │    └── fd: (1)-->(2)
+ │                        └── projections
+ │                             └── (x:1, z:2) [as="?column?":3, outer=(1,2)]
+ └── projections
+      ├── (column1:4).@1 [as="?column?":5, outer=(4)]
+      └── (column1:4).@2 [as="?column?":6, outer=(4)]
+
+# No-op case because the tuple itself is referenced rather than just its fields.
+norm expect-not=FoldTupleAccessIntoValues
+SELECT (tup).@1, (tup).@2, ARRAY[tup] FROM (VALUES ((1,2)), ((3,4))) AS v(tup)
+----
+project
+ ├── columns: "?column?":2 "?column?":3 array:4
+ ├── cardinality: [2 - 2]
+ ├── values
+ │    ├── columns: column1:1
+ │    ├── cardinality: [2 - 2]
+ │    ├── ((1, 2),)
+ │    └── ((3, 4),)
+ └── projections
+      ├── (column1:1).@1 [as="?column?":2, outer=(1)]
+      ├── (column1:1).@2 [as="?column?":3, outer=(1)]
+      └── ARRAY[column1:1] [as=array:4, outer=(1)]
+
+# No-op case because the tuple itself is referenced. Make sure that a reference
+# inside the input of a ColumnAccess is detected.
+norm expect-not=FoldTupleAccessIntoValues
+SELECT (least(tup, (1,2))).a FROM (VALUES (((1,2) AS a,b), ((3,4) AS a,b))) v(tup)
+----
+project
+ ├── columns: a:3
+ ├── cardinality: [1 - 1]
+ ├── immutable
+ ├── key: ()
+ ├── fd: ()-->(3)
+ ├── values
+ │    ├── columns: column1:1
+ │    ├── cardinality: [1 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1)
+ │    └── (((1, 2) AS a, b),)
+ └── projections
+      └── (least(column1:1, (1, 2))).a [as=a:3, outer=(1), immutable]
+
+# --------------------------------------------------
+# PushColumnRemappingIntoValues
+# --------------------------------------------------
+
+# With clause case. This works because InlineWith creates a simple remapping
+# projection on the Values output column.
+norm expect=PushColumnRemappingIntoValues
+WITH a AS (SELECT x FROM (VALUES (1), (2)) f(x)) SELECT x FROM a
+----
+values
+ ├── columns: x:2!null
+ ├── cardinality: [2 - 2]
+ ├── (1,)
+ └── (2,)
+
+# Multiplication by one case. This works because after FoldMultOne and
+# EliminateCast fire, the x*1 projection does no more than rename its input
+# column.
+norm expect=PushColumnRemappingIntoValues
+SELECT x*1 FROM (VALUES (1), (2)) f(x)
+----
+values
+ ├── columns: "?column?":2!null
+ ├── cardinality: [2 - 2]
+ ├── (1,)
+ └── (2,)
+
+# Tuple access case. This works because FoldTupleAccessIntoValues creates new
+# columns that reference the tuple fields, and so the surrounding Project that
+# references those fields becomes a remapping of the new columns.
+norm expect=PushColumnRemappingIntoValues
+SELECT (tup).@1, (tup).@2 FROM (VALUES ((1,2)), ((3,4))) AS v(tup)
+----
+values
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── (1, 2)
+ └── (3, 4)
+
+# Case with multiple remappings of the same column.
+norm expect=PushColumnRemappingIntoValues
+WITH a AS (SELECT x, x FROM (VALUES (1), (2)) f(x)) SELECT * FROM a
+----
+project
+ ├── columns: x:2!null x:3!null
+ ├── cardinality: [2 - 2]
+ ├── fd: (2)==(3), (3)==(2)
+ ├── values
+ │    ├── columns: x:2!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1,)
+ │    └── (2,)
+ └── projections
+      └── x:2 [as=x:3, outer=(2)]
+
+# Case with a projection on a column only determined at run-time.
+norm expect=PushColumnRemappingIntoValues
+WITH a AS (SELECT v FROM (VALUES (1), ((SELECT z FROM b WHERE z=1))) f(v)) SELECT v FROM a
+----
+values
+ ├── columns: v:4
+ ├── cardinality: [2 - 2]
+ ├── (1,)
+ └── tuple
+      └── subquery
+           └── max1-row
+                ├── columns: z:2!null
+                ├── error: "more than one row returned by a subquery used as an expression"
+                ├── cardinality: [0 - 1]
+                ├── key: ()
+                ├── fd: ()-->(2)
+                └── select
+                     ├── columns: z:2!null
+                     ├── fd: ()-->(2)
+                     ├── scan b
+                     │    └── columns: z:2
+                     └── filters
+                          └── z:2 = 1 [outer=(2), constraints=(/2: [/1 - /1]; tight), fd=()-->(2)]
+
+# Case with a non-VariableExpr reference to a remapped column.
+norm expect=PushColumnRemappingIntoValues
+SELECT x*1, x+1 FROM (VALUES (1), (2)) f(x)
+----
+project
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── fd: (2)-->(3)
+ ├── values
+ │    ├── columns: "?column?":2!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1,)
+ │    └── (2,)
+ └── projections
+      └── "?column?":2 + 1 [as="?column?":3, outer=(2)]
+
+# Case with a subquery reference to a remapped column.
+norm expect=PushColumnRemappingIntoValues
+SELECT
+    x*1,
+    (SELECT * FROM (Values (1), (2), (3), (4)) WHERE x=12)
+FROM
+    (VALUES (11), (12)) f(x)
+----
+project
+ ├── columns: "?column?":3!null "?column?":4
+ ├── cardinality: [1 - 8]
+ ├── ensure-distinct-on
+ │    ├── columns: column1:2 "?column?":3!null rownum:5!null
+ │    ├── grouping columns: rownum:5!null
+ │    ├── error: "more than one row returned by a subquery used as an expression"
+ │    ├── cardinality: [1 - 8]
+ │    ├── key: (5)
+ │    ├── fd: (5)-->(2,3)
+ │    ├── left-join (cross)
+ │    │    ├── columns: column1:2 "?column?":3!null rownum:5!null
+ │    │    ├── cardinality: [2 - 8]
+ │    │    ├── fd: (5)-->(3)
+ │    │    ├── ordinality
+ │    │    │    ├── columns: "?column?":3!null rownum:5!null
+ │    │    │    ├── cardinality: [2 - 2]
+ │    │    │    ├── key: (5)
+ │    │    │    ├── fd: (5)-->(3)
+ │    │    │    └── values
+ │    │    │         ├── columns: "?column?":3!null
+ │    │    │         ├── cardinality: [2 - 2]
+ │    │    │         ├── (11,)
+ │    │    │         └── (12,)
+ │    │    ├── values
+ │    │    │    ├── columns: column1:2!null
+ │    │    │    ├── cardinality: [4 - 4]
+ │    │    │    ├── (1,)
+ │    │    │    ├── (2,)
+ │    │    │    ├── (3,)
+ │    │    │    └── (4,)
+ │    │    └── filters
+ │    │         └── "?column?":3 = 12 [outer=(3), constraints=(/3: [/12 - /12]; tight), fd=()-->(3)]
+ │    └── aggregations
+ │         ├── const-agg [as=column1:2, outer=(2)]
+ │         │    └── column1:2
+ │         └── const-agg [as="?column?":3, outer=(3)]
+ │              └── "?column?":3
+ └── projections
+      └── column1:2 [as="?column?":4, outer=(2)]
+
+# PushColumnRemappingIntoValues should only fold one projection into the
+# passthrough columns because all the projections refer to the same column.
+norm expect=PushColumnRemappingIntoValues
+SELECT x*1*1, x*1 FROM (VALUES (1), (2)) v(x)
+----
+project
+ ├── columns: "?column?":2!null "?column?":3!null
+ ├── cardinality: [2 - 2]
+ ├── fd: (2)==(3), (3)==(2)
+ ├── values
+ │    ├── columns: "?column?":2!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1,)
+ │    └── (2,)
+ └── projections
+      └── "?column?":2 [as="?column?":3, outer=(2)]
+
+# Case with only one column that can be replaced (The z*1 column can replace the
+# original z column).
+norm expect=PushColumnRemappingIntoValues
+SELECT x, x*1, y, y*1, z*1 FROM (VALUES (1,2,3), (2,3,6)) v(x,y,z)
+----
+project
+ ├── columns: x:1!null "?column?":4!null y:2!null "?column?":5!null "?column?":6!null
+ ├── cardinality: [2 - 2]
+ ├── fd: (1)==(4), (4)==(1), (2)==(5), (5)==(2)
+ ├── values
+ │    ├── columns: column1:1!null column2:2!null "?column?":6!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1, 2, 3)
+ │    └── (2, 3, 6)
+ └── projections
+      ├── column1:1 [as="?column?":4, outer=(1)]
+      └── column2:2 [as="?column?":5, outer=(2)]
+
+# No-op case because no columns from the input ValuesExpr are being remapped.
+norm expect-not=PushColumnRemappingIntoValues
+SELECT (SELECT x FROM (VALUES (1), (2)) f(x)) FROM (VALUES (2), (3))
+----
+project
+ ├── columns: x:3
+ ├── cardinality: [2 - 2]
+ ├── fd: ()-->(3)
+ ├── values
+ │    ├── cardinality: [2 - 2]
+ │    ├── ()
+ │    └── ()
+ └── projections
+      └── subquery [as=x:3, subquery]
+           └── max1-row
+                ├── columns: column1:2!null
+                ├── error: "more than one row returned by a subquery used as an expression"
+                ├── cardinality: [1 - 1]
+                ├── key: ()
+                ├── fd: ()-->(2)
+                └── values
+                     ├── columns: column1:2!null
+                     ├── cardinality: [2 - 2]
+                     ├── (1,)
+                     └── (2,)
+
+# No-op case because a passthrough column is being remapped.
+norm expect-not=PushColumnRemappingIntoValues
+SELECT x, x*1 FROM (VALUES (1), (2)) v(x)
+----
+project
+ ├── columns: x:1!null "?column?":2!null
+ ├── cardinality: [2 - 2]
+ ├── fd: (1)==(2), (2)==(1)
+ ├── values
+ │    ├── columns: column1:1!null
+ │    ├── cardinality: [2 - 2]
+ │    ├── (1,)
+ │    └── (2,)
+ └── projections
+      └── column1:1 [as="?column?":2, outer=(1)]
+
+# No-op case because the Project is on a Scan rather than a Values operator.
+norm expect-not=PushColumnRemappingIntoValues
+WITH t AS (SELECT * FROM a) SELECT x FROM t
+----
+project
+ ├── columns: x:5!null
+ ├── key: (5)
+ ├── scan a
+ │    ├── columns: a.x:1!null
+ │    └── key: (1)
+ └── projections
+      └── a.x:1 [as=x:5, outer=(1)]
+
+# No-op case with no projections on the Project surrounding the Values operator.
+# A Project with no projections is created when PruneUnionAllCols fires, and is
+# then removed by EliminateProject.
+norm expect-not=PushColumnRemappingIntoValues
+WITH a AS
+(
+  SELECT * FROM (VALUES (1,2)) AS f(x,y)
+  UNION ALL (VALUES (3,4))
+)
+SELECT x FROM a
+----
+project
+ ├── columns: x:7!null
+ ├── cardinality: [2 - 2]
+ ├── union-all
+ │    ├── columns: x:5!null
+ │    ├── left columns: column1:1
+ │    ├── right columns: column1:3
+ │    ├── cardinality: [2 - 2]
+ │    ├── values
+ │    │    ├── columns: column1:1!null
+ │    │    ├── cardinality: [1 - 1]
+ │    │    ├── key: ()
+ │    │    ├── fd: ()-->(1)
+ │    │    └── (1,)
+ │    └── values
+ │         ├── columns: column1:3!null
+ │         ├── cardinality: [1 - 1]
+ │         ├── key: ()
+ │         ├── fd: ()-->(3)
+ │         └── (3,)
+ └── projections
+      └── x:5 [as=x:7, outer=(5)]

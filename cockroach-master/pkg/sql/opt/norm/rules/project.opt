@@ -1,0 +1,140 @@
+# =============================================================================
+# project.opt contains normalization rules for the Project operator.
+# =============================================================================
+
+# EliminateProject discards a Project operator which is not adding or removing
+# columns.
+[EliminateProject, Normalize]
+(Project
+    $input:*
+    $projections:[]
+    $passthrough:* &
+        (ColsAreEqual $passthrough (OutputCols $input))
+)
+=>
+$input
+
+# MergeProjects merges an outer Project operator with an inner Project operator
+# if there are no references to the inner synthesized columns. This has the
+# side effect of pruning unused synthesized columns of the inner Project.
+[MergeProjects, Normalize]
+(Project
+    $input:(Project $innerInput:* $innerProjections:*)
+    $projections:* &
+        (CanMergeProjections $projections $innerProjections)
+    $passthrough:*
+)
+=>
+(Project
+    $innerInput
+    (MergeProjections
+        $projections
+        $innerProjections
+        $passthrough
+    )
+    (DifferenceCols
+        $passthrough
+        (ProjectionCols $innerProjections)
+    )
+)
+
+# MergeProjectWithValues merges an outer Project operator with an inner Values
+# operator that has a single row, as long as:
+#
+#   1. The Values operator has a single row (since if not, the projections would
+#      need to replicated for each row, which is undesirable).
+#
+#   2. The projections do not reference Values columns, since combined Values
+#      columns cannot reference one another.
+#
+# This rule has the side effect of pruning unused columns of the Values
+# operator.
+[MergeProjectWithValues, Normalize]
+(Project
+    $input:(Values [ * ])
+    $projections:* &
+        ^(AreProjectionsCorrelated
+            $projections
+            (OutputCols $input)
+        )
+    $passthrough:*
+)
+=>
+(MergeProjectWithValues $projections $passthrough $input)
+
+# PushColumnRemappingIntoValues folds ProjectionsItems into the passthrough set
+# if they simply remap Values output columns that are not already in
+# passthrough. The Values output columns are replaced with the corresponding
+# columns projected by the folded ProjectionsItems.
+#
+# Example:
+#
+# project
+#  ├── columns: x:2!null
+#  ├── values
+#  │    ├── columns: column1:1!null
+#  │    ├── cardinality: [2 - 2]
+#  │    ├── (1,)
+#  │    └── (2,)
+#  └── projections
+#       └── column1:1 [as=x:2, outer=(1)]
+# =>
+# project
+#  ├── columns: x:2!null
+#  └── values
+#       ├── columns: x:2!null
+#       ├── cardinality: [2 - 2]
+#       ├── (1,)
+#       └── (2,)
+#
+# This allows other rules to fire. In the example above, the project would now
+# be removed by EliminateProject.
+[PushColumnRemappingIntoValues, Normalize]
+(Project
+    $input:(Values)
+    $projections:*
+    $passthrough:* &
+        (CanPushColumnRemappingIntoValues
+            $projections
+            $passthrough
+            $input
+        )
+)
+=>
+(PushColumnRemappingIntoValues $input $projections $passthrough)
+
+# FoldTupleAccessIntoValues replaces a Values with a single column that
+# references a column of tuples with a new Values that has a column for each
+# tuple index. This works as long as the surrounding Project does not reference
+# the original tuple column itself, since then it would be invalid to eliminate
+# that reference. However, references to fields within the tuple are allowed,
+# and are translated to the new unnested Values columns.
+#
+# This rule simplifies access to the Values operator in hopes of allowing other
+# rules to fire.
+#
+# Example:
+#
+#   SELECT (tup).@1, (tup).@2 FROM (VALUES ((1,2)), ((3,4))) AS v(tup)
+#   =>
+#   SELECT tup_1, tup_2 FROM (VALUES (1, 2), (3, 4)) AS v(tup_1, tup_2)
+#
+[FoldTupleAccessIntoValues, Normalize]
+(Project
+    $input:(Values) & (CanUnnestTuplesFromValues $input)
+    $projections:* &
+        (OnlyTupleColumnsAccessed
+            $projections
+            $col:(SingleColFromSet (OutputCols $input))
+        )
+    $passthrough:* & (ColsAreEmpty $passthrough)
+)
+=>
+(Project
+    (UnnestTuplesFromValues
+        $input
+        $tuplecols:(MakeColsForUnnestTuples $col)
+    )
+    (FoldTupleColumnAccess $projections $tuplecols $col)
+    $passthrough
+)

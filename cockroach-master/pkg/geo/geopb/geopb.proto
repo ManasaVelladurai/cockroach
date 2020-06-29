@@ -1,0 +1,54 @@
+// Copyright 2020 The Cockroach Authors.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.txt.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0, included in the file
+// licenses/APL.txt.
+
+syntax = "proto3";
+package cockroach.geopb;
+option go_package = "geopb";
+
+import "gogoproto/gogo.proto";
+
+// Shape is the type of a spatial shape. Each of these corresponds to a
+// different representation and serialization format. For example, a Point is a
+// pair of doubles (or more than that for geometries with Z or N), a LineString
+// is an ordered series of Points, etc.
+enum Shape {
+  Unset = 0;
+
+  Point = 1;
+  LineString = 2;
+  Polygon = 3;
+  MultiPoint = 4;
+  MultiLineString = 5;
+  MultiPolygon = 6;
+  // Geometry can contain any type.
+  Geometry = 7;
+  // GeometryCollection can contain a list of any above type except for Geometry.
+  GeometryCollection = 8;
+}
+
+// SpatialObject represents a serialization of a Geospatial type.
+message SpatialObject {
+  // EWKB is the EWKB representation of the spatial object.
+  bytes ewkb = 1 [(gogoproto.customname)="EWKB",(gogoproto.casttype)="EWKB"];
+  // SRID is the denormalized SRID derived from the EWKB.
+  int32 srid = 2 [(gogoproto.customname)="SRID",(gogoproto.casttype)="SRID"];
+  // Shape is denormalized Shape derived from the EWKB.
+  Shape shape = 3;
+  // BoundingBox is the bounding box of the SpatialObject.
+  BoundingBox bounding_box = 4;
+}
+
+// BoundingBox represents the bounding box of a Geospatial type.
+message BoundingBox {
+  double min_x = 1;
+  double min_y = 2;
+  double max_x = 3;
+  double max_y = 4;
+}
