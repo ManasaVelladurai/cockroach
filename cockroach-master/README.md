@@ -32,7 +32,7 @@ https://www.cockroachlabs.com/docs/stable/architecture/overview.html).
 <p align="center">
   <a href='https://www.youtube.com/watch?v=VgXiMcbGwzQ'> <img src='docs/media/explainer-video-preview.png' width='70%'> </a>
 </p>
-
+<p> new changes commit <p> 
 ## Docs
 
 For guidance on installation, development, deployment, and administration, see our [User Documentation](https://cockroachlabs.com/docs/stable/).
